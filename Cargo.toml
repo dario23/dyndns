@@ -6,7 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "^1.0", features = [ "net", "sync", "rt" ]}
+tokio = { version = "^1.0", features = [ "net", "sync", "rt", "macros" ]}
 # tokio-rustls = "0.23.4"
 trust-dns-server = "0.22"
 clap = { version = "^3", features = [ "derive" ]}
+async-trait = "^0.1"
+axum = "^0.5"
