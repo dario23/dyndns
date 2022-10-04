@@ -15,9 +15,8 @@ use axum::{
 };
 use clap::Parser;
 
-use tokio::{runtime, net::{TcpListener, UdpSocket}, sync::Mutex};
+use tokio::{runtime, net::{TcpListener, UdpSocket}};
 use trust_dns_server::client::rr::RecordSet;
-use trust_dns_server::server::{RequestHandler, ResponseHandler, Request, ResponseInfo};
 use trust_dns_server::{
     authority::{Catalog, ZoneType},
     store::in_memory::InMemoryAuthority,
@@ -36,46 +35,35 @@ struct DynDnsServerConfig {
     pub http_listen_addr: String,
 }
 
+#[derive(Clone)]
 struct SynchronizedState {
-    catalog: Arc<Mutex<Catalog>>,
+    authority: Arc<InMemoryAuthority>,
 }
 
 impl SynchronizedState {
-    pub fn new(catalog: Catalog) -> Self {
+    pub fn new(authority: Arc<InMemoryAuthority>) -> Self {
         Self {
-            catalog: Arc::new(Mutex::new(catalog)),
+            authority
         }
     }
 }
 
-impl Clone for SynchronizedState {
-    fn clone(&self) -> Self {
-        Self {
-            catalog: self.catalog.clone()
-        }
-    }
+#[derive(Clone)]
+struct AppConfig {
+    base_dns_name: Name,
 }
 
-#[async_trait::async_trait]
-impl RequestHandler for SynchronizedState {
-    async fn handle_request<R: ResponseHandler>(&self, request: &Request, response_handle: R) -> ResponseInfo {
-        self.catalog
-            .lock()
-            .await
-            .handle_request(request, response_handle)
-            .await
-    }
-}
 
 fn make_authority(name: &Name, records: BTreeMap<RrKey, RecordSet>) -> InMemoryAuthority {
     InMemoryAuthority::new(name.clone(), records, ZoneType::Primary, false)
         .expect("cannot create InMemoryAuthority")
 }
 
+
 fn main() {
     let opts = DynDnsServerConfig::parse();
 
-    let name = Name::from_str("d.q0b.de").expect("cannot parse name");
+    let name = Name::from_str("d.q0b.de.").expect("cannot parse name");
     let mut records = BTreeMap::new();
     records.insert(
         RrKey::new(name.clone().into(), RecordType::SOA),
@@ -87,14 +75,14 @@ fn main() {
         .into(),
     );
 
-    let authority = make_authority(&name, records);
+    let authority = Arc::new(make_authority(&name, records));
     let mut catalog = Catalog::new();
-    catalog.upsert(name.clone().into(), Box::new(Arc::new(authority)));
+    catalog.upsert(name.clone().into(), Box::new(Arc::clone(&authority)));
 
-    let dns_state_handle = SynchronizedState::new(catalog);
-    let http_state_handle = dns_state_handle.clone();
+    // NICE: we can keep a reference to the authority even if we gave it to the catalog for serving, i.e. we can update it from the other thread :-)
+    // let foo = authority.lookup(&name.clone().into(), RecordType::A, LookupOptions::default());
 
-    let mut dns_server = ServerFuture::new(dns_state_handle);
+    let mut dns_server = ServerFuture::new(catalog);
 
     // NEXT TODO: this line doesn't work, because ServerFuture wants ownership of the handler
     // catalog.lookup(todo!(), todo!(), ResponseHandle::new(todo!(), todo!()));
@@ -122,7 +110,8 @@ fn main() {
     let http_app = Router::new()
         .route("/", get(get_own_ipaddr))
         .route("/", post(update_own_ipaddr))
-        .layer(Extension(http_state_handle));
+        .layer(Extension(SynchronizedState::new(authority)))
+        .layer(Extension(AppConfig { base_dns_name: name }));
 
     let http_listen_addr = opts.http_listen_addr.parse().expect("HTTP listen address malformed");
     let http_server = axum::Server::bind(&http_listen_addr)
@@ -162,82 +151,25 @@ async fn get_own_ipaddr(client_addr: ConnectInfo<SocketAddr>) -> String {
     }
 }
 
-async fn update_own_ipaddr(state: Extension<SynchronizedState>, client_addr: ConnectInfo<SocketAddr>) -> impl IntoResponse {
-    let name = Name::from_str("d.q0b.de").expect("cannot parse name");
+async fn update_own_ipaddr(state: Extension<SynchronizedState>, app_config: Extension<AppConfig>, client_addr: ConnectInfo<SocketAddr>) -> impl IntoResponse {
+    let name = Name::from_str("foo")
+        .expect("parse foo")
+        .append_domain(&app_config.base_dns_name)
+        .expect("append domain");
 
-    let mut new_records = BTreeMap::new();
-
-    // always need a SOA entry!
-    // TODO: de-duplicate with above/somehow not recreate the whole thing
-    new_records.insert(
-        RrKey::new(name.clone().into(), RecordType::SOA),
-        Record::from_rdata(
-            name.clone(),
-            0,
-            RData::SOA(SOA::new(name.clone(), name.clone(), 0, 0, 0, 0, 0)),
-        )
-        .into(),
+    let record = Record::from_rdata(
+        name,
+        1800,
+        match client_addr_family(&client_addr.0) {
+            V46::V4(v4) => RData::A(v4),
+            V46::V6(v6) => RData::AAAA(v6),
+        },
     );
 
-    match client_addr_family(&client_addr.0) {
-        V46::V4(v4) => {
-            new_records.insert(
-                RrKey::new(name.clone().into(), RecordType::A),
-                Record::from_rdata(
-                    name.clone(),
-                    0,
-                    RData::A(v4)
-                ).into(),
-            );
-            eprintln!("updated ipv4 addr to {}", v4);
-        }
-        V46::V6(v6) => {
-            new_records.insert(
-                RrKey::new(name.clone().into(), RecordType::AAAA),
-                Record::from_rdata(
-                    name.clone(),
-                    0,
-                    RData::AAAA(v6)
-                ).into()
-            );
-            eprintln!("updated ipv6 addr to {}", v6);
-        }
-    }
+    state
+        .authority
+        .upsert(record, 42)
+        .await;
 
-    let new_authority = make_authority(&name.clone(), new_records);
-    state.catalog
-        .lock()
-        .await
-        .upsert(name.into(), Box::new(Arc::new(new_authority)));
+    "ok"
 }
-
-    /*
-    let previous_data = catalog.find(&name.clone().into());
-
-    let new_records = if let Some(previous_data) = previous_data {
-        let mut previous_entries = BTreeMap::new();
-        for record in previous_data.lookup(&name.clone().into(), RecordType::ANY, LookupOptions::default()).await.unwrap().iter() {
-            record.data()
-        }
-    } else {
-        BTreeMap::new()
-    };
-    let new_authority = make_authority(&name, new_records);
-    catalog.upsert(name.into(), Box::new(Arc::new(new_authority)))
- */
-
- /*
-    let previous_data = catalog.find(&name.clone().into()).unwrap();
-    match (&previous_data as &dyn Any).downcast_ref::<InMemoryAuthority>() {
-        Some(in_memory_authority) => {
-            let record = Record::from_rdata(
-                name.clone(),
-                0,
-                RData::SOA(SOA::new(name.clone(), name.clone(), 0, 0, 0, 0, 0))
-            );
-            in_memory_authority.upsert(record, 42).await;
-            Ok("success")
-        },
-        None => return Err("internal error"),
-    }
- */
